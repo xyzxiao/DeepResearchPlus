@@ -183,47 +183,29 @@ After each search tool call, use think_tool to analyze the results:
 """
 
 
-compress_research_system_prompt = """You are a research assistant that has conducted research on a topic by calling several tools and web searches. Your job is now to clean up the findings, but preserve all of the relevant statements and information that the researcher has gathered. For context, today's date is {date}.
+compress_research_system_prompt = """You are a research assistant that has conducted research on a topic by calling several tools and web searches. Produce a structured research result. For context, today's date is {date}.
 
 <Task>
-You need to clean up information gathered from tool calls and web searches in the existing messages.
-All relevant information should be repeated and rewritten verbatim, but in a cleaner format.
-The purpose of this step is just to remove any obviously irrelevant or duplicative information.
-For example, if three sources all say "X", you could say "These three sources all stated X".
-Only these fully comprehensive cleaned findings are going to be returned to the user, so it's crucial that you don't lose any information from the raw messages.
+Use the conversation and tool summaries to write a comprehensive research summary. Separately select a small number of the most relevant candidate quotes from the raw source material below. Also list important questions that the available material did not answer.
 </Task>
 
 <Guidelines>
-1. Your output findings should be fully comprehensive and include ALL of the information and sources that the researcher has gathered from tool calls and web searches. It is expected that you repeat key information verbatim.
-2. This report can be as long as necessary to return ALL of the information that the researcher has gathered.
-3. In your report, you should return inline citations for each source that the researcher found.
-4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
-5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
-6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+1. The summary may synthesize and paraphrase the gathered information and should retain URLs where useful to the supervisor.
+2. Return at most 5 evidence candidates, chosen for relevance rather than quantity.
+3. Every candidate quote must be copied from one RAW_CONTENT block exactly. Do not translate, correct, shorten with ellipses, or paraphrase it.
+4. Preserve numbers, dates, scope, and qualifications in each quote.
+5. A candidate URL must exactly match the URL of the RAW_CONTENT block containing the quote.
+6. Do not invent evidence IDs. The program verifies candidates and assigns IDs later.
+7. Tool results without a RAW_CONTENT block may inform the summary but must not be used as evidence candidates.
+8. If no raw source supports a useful quote, return an empty evidence_candidates list.
 </Guidelines>
 
-<Output Format>
-The report should be structured like this:
-**List of Queries and Tool Calls Made**
-**Fully Comprehensive Findings**
-**List of All Relevant Sources (with citations in the report)**
-</Output Format>
-
-<Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-</Citation Rules>
-
-Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
+<RawSourceMaterial>
+{source_material}
+</RawSourceMaterial>
 """
 
-compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
-
-DO NOT summarize the information. I want the raw information returned, just in a cleaner format. Make sure all relevant information is preserved - you can rewrite findings verbatim."""
+compress_research_simple_human_message = """Create the structured research synthesis now. Keep the summary useful to the supervisor, and only select evidence candidates copied from the supplied raw source material."""
 
 final_report_generation_prompt = """Based on all the research conducted, create a comprehensive, well-structured answer to the overall research brief:
 <Research Brief>
@@ -245,12 +227,22 @@ Here are the findings from the research that you conducted:
 {findings}
 </Findings>
 
+Here is the complete table of program-verified evidence available for citation:
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Questions that the researchers could not resolve:
+<UnansweredQuestions>
+{unanswered_questions}
+</UnansweredQuestions>
+
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
 2. Includes specific facts and insights from the research
-3. References relevant sources using [Title](URL) format
+3. Places citations such as [E1] immediately after concrete claims supported by the evidence table
 4. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
-5. Includes a "Sources" section at the end with all referenced links
+5. Does not write a Sources or References section; the program will append links after validating citations
 
 You can structure your report in a number of different ways. Here are some examples:
 
@@ -296,14 +288,11 @@ Make sure the final answer report is in the SAME language as the human messages 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+- Cite only IDs that appear in EvidenceTable, using the exact [E1], [E2] format.
+- Never invent an evidence ID, URL, publication title, link, footnote, or bibliography entry.
+- The findings are useful context but are not themselves verified quotations. Cite a claim only when an evidence quote supports it.
+- If the evidence is insufficient, explicitly state the limitation instead of manufacturing a citation.
+- Do not include raw URLs or Markdown source links in the report body.
 </Citation Rules>
 """
 

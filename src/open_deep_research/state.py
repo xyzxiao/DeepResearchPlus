@@ -27,6 +27,46 @@ class Summary(BaseModel):
     summary: str
     key_excerpts: str
 
+
+class SourceDocument(BaseModel):
+    """Raw source material fetched during one researcher's tool calls."""
+
+    url: str
+    title: str
+    raw_content: str
+
+
+class EvidenceCandidate(BaseModel):
+    """A model-selected quote that still needs deterministic verification."""
+
+    url: str
+    quote: str
+
+
+class ResearchSynthesis(BaseModel):
+    """Structured model output produced before evidence verification."""
+
+    summary: str
+    evidence_candidates: list[EvidenceCandidate] = Field(default_factory=list)
+    unanswered_questions: list[str] = Field(default_factory=list)
+
+
+class Evidence(BaseModel):
+    """A quote verified against raw content fetched from its source URL."""
+
+    id: str
+    url: str
+    title: str
+    quote: str
+
+
+class ResearchResult(BaseModel):
+    """The structured, inspectable result returned by one researcher."""
+
+    summary: str
+    evidences: list[Evidence] = Field(default_factory=list)
+    unanswered_questions: list[str] = Field(default_factory=list)
+
 class ClarifyWithUser(BaseModel):
     """Model for user clarification requests."""
     
@@ -69,6 +109,10 @@ class AgentState(MessagesState):
     research_brief: Optional[str]
     raw_notes: Annotated[list[str], override_reducer] = []
     notes: Annotated[list[str], override_reducer] = []
+    research_results: Annotated[list[ResearchResult], override_reducer] = []
+    evidences: Annotated[list[Evidence], override_reducer] = []
+    evidence_errors: Annotated[list[str], override_reducer] = []
+    citation_errors: list[str] = []
     final_report: str
 
 class SupervisorState(TypedDict):
@@ -79,6 +123,9 @@ class SupervisorState(TypedDict):
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
+    research_results: Annotated[list[ResearchResult], override_reducer] = []
+    evidences: Annotated[list[Evidence], override_reducer] = []
+    evidence_errors: Annotated[list[str], override_reducer] = []
 
 class ResearcherState(TypedDict):
     """State for individual researchers conducting research."""
@@ -88,9 +135,14 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    sources: Annotated[list[SourceDocument], operator.add]
+    research_result: ResearchResult
+    evidence_errors: list[str]
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""
     
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    research_result: ResearchResult
+    evidence_errors: list[str] = Field(default_factory=list)

@@ -33,14 +33,21 @@ from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
     ConductResearch,
+    Evidence,
     ResearchComplete,
+    ResearchResult,
+    ResearchSynthesis,
     ResearcherOutputState,
     ResearcherState,
     ResearchQuestion,
+    SourceDocument,
     SupervisorState,
 )
 from open_deep_research.utils import (
+    aggregate_evidences,
     anthropic_websearch_called,
+    append_cited_sources,
+    format_evidence_table,
     get_all_tools,
     get_api_key_for_model,
     get_model_token_limit,
@@ -50,6 +57,8 @@ from open_deep_research.utils import (
     openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
+    validate_evidence_candidates,
+    validate_report_citations,
 )
 
 # Initialize a configurable model that we will use throughout the agent
@@ -164,6 +173,10 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
+            "research_results": {"type": "override", "value": []},
+            "evidences": {"type": "override", "value": []},
+            "evidence_errors": {"type": "override", "value": []},
+            "citation_errors": [],
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -222,6 +235,17 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         }
     )
 
+
+def _supervisor_final_update(state: SupervisorState) -> dict:
+    """Build the final supervisor payload while preserving verified evidence separately."""
+    final_evidences = aggregate_evidences(state.get("evidences", []))
+    return {
+        "notes": get_notes_from_tool_calls(state.get("supervisor_messages", [])),
+        "research_brief": state.get("research_brief", ""),
+        "evidences": {"type": "override", "value": final_evidences},
+    }
+
+
 async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     """Execute tools called by the supervisor, including research delegation and strategic thinking.
     
@@ -255,10 +279,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
         return Command(
             goto=END,
-            update={
-                "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
-            }
+            update=_supervisor_final_update(state)
         )
     
     # Step 2: Process all tool calls together (both think_tool and ConductResearch)
@@ -306,11 +327,32 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             
             # Create tool messages with research results
             for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
+                research_result_value = observation.get("research_result")
+                if research_result_value:
+                    research_result = (
+                        research_result_value
+                        if isinstance(research_result_value, ResearchResult)
+                        else ResearchResult.model_validate(research_result_value)
+                    )
+                else:
+                    research_result = ResearchResult(
+                        summary=observation.get(
+                            "compressed_research",
+                            "Error synthesizing research report: Maximum retries exceeded",
+                        )
+                    )
                 all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
+                    # The supervisor plans from summaries as before; evidence travels
+                    # through dedicated state fields so later compression cannot drop it.
+                    content=research_result.summary,
                     name=tool_call["name"],
                     tool_call_id=tool_call["id"]
                 ))
+                update_payload.setdefault("research_results", []).append(research_result)
+                update_payload.setdefault("evidences", []).extend(research_result.evidences)
+                update_payload.setdefault("evidence_errors", []).extend(
+                    observation.get("evidence_errors", [])
+                )
             
             # Handle overflow research calls with error messages
             for overflow_call in overflow_conduct_research_calls:
@@ -335,10 +377,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 # Token limit exceeded or other error - end research phase
                 return Command(
                     goto=END,
-                    update={
-                        "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", "")
-                    }
+                    update=_supervisor_final_update(state)
                 )
     
     # Step 3: Return command with all tool results
@@ -478,15 +517,29 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     ]
     observations = await asyncio.gather(*tool_execution_tasks)
     
-    # Create tool messages from execution results
-    tool_outputs = [
-        ToolMessage(
-            content=observation,
+    # Tavily returns model-facing summaries and raw sources together. Only the
+    # summaries enter the ReAct conversation; raw content stays in this
+    # researcher's state until evidence extraction.
+    tool_outputs = []
+    collected_sources: list[SourceDocument] = []
+    for observation, tool_call in zip(observations, tool_calls):
+        if tool_call["name"] == "tavily_search" and isinstance(observation, dict):
+            content = str(observation.get("content", ""))
+            collected_sources.extend(
+                SourceDocument.model_validate(source)
+                for source in observation.get("sources", [])
+            )
+        else:
+            content = str(observation)
+        tool_outputs.append(ToolMessage(
+            content=content,
             name=tool_call["name"],
             tool_call_id=tool_call["id"]
-        ) 
-        for observation, tool_call in zip(observations, tool_calls)
-    ]
+        ))
+
+    tool_update = {"researcher_messages": tool_outputs}
+    if collected_sources:
+        tool_update["sources"] = collected_sources
     
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
@@ -499,17 +552,17 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         # End research and proceed to compression
         return Command(
             goto="compress_research",
-            update={"researcher_messages": tool_outputs}
+            update=tool_update
         )
     
     # Continue research loop with tool results
     return Command(
         goto="researcher",
-        update={"researcher_messages": tool_outputs}
+        update=tool_update
     )
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
-    """Compress and synthesize research findings into a concise, structured summary.
+    """Synthesize a summary and verify candidate quotes against fetched raw pages.
     
     This function takes all the research findings, tool outputs, and AI messages from
     a researcher's work and distills them into a clean, comprehensive summary while
@@ -520,19 +573,40 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         config: Runtime configuration with compression model settings
         
     Returns:
-        Dictionary containing compressed research summary and raw notes
+        Dictionary containing a structured research result and raw notes
     """
     # Step 1: Configure the compression model
     configurable = Configuration.from_runnable_config(config)
-    synthesizer_model = configurable_model.with_config({
-        "model": configurable.compression_model,
-        "max_tokens": configurable.compression_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.compression_model, config),
-        "tags": ["langsmith:nostream"]
-    })
+    synthesizer_model = (
+        configurable_model
+        .with_structured_output(ResearchSynthesis)
+        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+        .with_config({
+            "model": configurable.compression_model,
+            "max_tokens": configurable.compression_model_max_tokens,
+            "api_key": get_api_key_for_model(configurable.compression_model, config),
+            "tags": ["langsmith:nostream"]
+        })
+    )
     
     # Step 2: Prepare messages for compression
-    researcher_messages = state.get("researcher_messages", [])
+    researcher_messages = list(state.get("researcher_messages", []))
+    raw_notes_content = "\n".join([
+        str(message.content)
+        for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
+    ])
+
+    # A URL can appear in several Tavily calls; retaining one copy avoids
+    # needlessly enlarging the evidence-extraction prompt.
+    unique_sources: dict[str, SourceDocument] = {}
+    for source_value in state.get("sources", []):
+        source = (
+            source_value
+            if isinstance(source_value, SourceDocument)
+            else SourceDocument.model_validate(source_value)
+        )
+        unique_sources.setdefault(source.url, source)
+    sources = list(unique_sources.values())
     
     # Add instruction to switch from research mode to compression mode
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
@@ -540,48 +614,71 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     # Step 3: Attempt compression with retry logic for token limit issues
     synthesis_attempts = 0
     max_attempts = 3
+    source_char_limit = configurable.max_content_length
     
     while synthesis_attempts < max_attempts:
         try:
             # Create system prompt focused on compression task
-            compression_prompt = compress_research_system_prompt.format(date=get_today_str())
+            if sources:
+                source_material = "\n\n".join(
+                    f"--- RAW SOURCE {index} ---\n"
+                    f"TITLE: {source.title}\n"
+                    f"URL: {source.url}\n"
+                    f"RAW_CONTENT:\n{source.raw_content[:source_char_limit]}"
+                    for index, source in enumerate(sources, start=1)
+                )
+            else:
+                source_material = (
+                    "No raw source content was captured. Return no evidence candidates; "
+                    "tool summaries may still be used for the research summary."
+                )
+            compression_prompt = compress_research_system_prompt.format(
+                date=get_today_str(),
+                source_material=source_material,
+            )
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
             
             # Execute compression
-            response = await synthesizer_model.ainvoke(messages)
-            
-            # Extract raw notes from all tool and AI messages
-            raw_notes_content = "\n".join([
-                str(message.content) 
-                for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-            ])
-            
-            # Return successful compression result
+            synthesis = await synthesizer_model.ainvoke(messages)
+            evidences, evidence_errors = validate_evidence_candidates(
+                synthesis.evidence_candidates,
+                sources,
+            )
+            research_result = ResearchResult(
+                summary=synthesis.summary,
+                evidences=evidences,
+                unanswered_questions=synthesis.unanswered_questions,
+            )
             return {
-                "compressed_research": str(response.content),
-                "raw_notes": [raw_notes_content]
+                "compressed_research": research_result.summary,
+                "research_result": research_result,
+                "evidence_errors": evidence_errors,
+                "raw_notes": [raw_notes_content],
             }
             
         except Exception as e:
             synthesis_attempts += 1
             
             # Handle token limit exceeded by removing older messages
-            if is_token_limit_exceeded(e, configurable.research_model):
+            if is_token_limit_exceeded(e, configurable.compression_model):
                 researcher_messages = remove_up_to_last_ai_message(researcher_messages)
+                source_char_limit = max(1000, int(source_char_limit * 0.7))
                 continue
             
             # For other errors, continue retrying
             continue
     
-    # Step 4: Return error result if all attempts failed
-    raw_notes_content = "\n".join([
-        str(message.content) 
-        for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-    ])
-    
+    # Step 4: Return an explicit empty-evidence result if all attempts failed
+    error_summary = "Error synthesizing research report: Maximum retries exceeded"
     return {
-        "compressed_research": "Error synthesizing research report: Maximum retries exceeded",
-        "raw_notes": [raw_notes_content]
+        "compressed_research": error_summary,
+        "research_result": ResearchResult(
+            summary=error_summary,
+            evidences=[],
+            unanswered_questions=["Research synthesis failed after maximum retries."],
+        ),
+        "evidence_errors": ["Research synthesis failed; no evidence candidates were accepted."],
+        "raw_notes": [raw_notes_content],
     }
 
 # Researcher Subgraph Construction
@@ -621,6 +718,19 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
     findings = "\n".join(notes)
+    evidences = [
+        evidence if isinstance(evidence, Evidence) else Evidence.model_validate(evidence)
+        for evidence in state.get("evidences", [])
+    ]
+    research_results = [
+        result if isinstance(result, ResearchResult) else ResearchResult.model_validate(result)
+        for result in state.get("research_results", [])
+    ]
+    unanswered_questions = [
+        question
+        for result in research_results
+        for question in result.unanswered_questions
+    ]
     
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
@@ -643,6 +753,11 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 research_brief=state.get("research_brief", ""),
                 messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
+                evidence_table=format_evidence_table(evidences),
+                unanswered_questions=(
+                    "\n".join(f"- {question}" for question in unanswered_questions)
+                    or "None recorded."
+                ),
                 date=get_today_str()
             )
             
@@ -651,10 +766,22 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 HumanMessage(content=final_report_prompt)
             ])
             
-            # Return successful report generation
+            cited_ids, citation_errors = validate_report_citations(
+                str(final_report.content),
+                evidences,
+            )
+            validated_report = append_cited_sources(
+                str(final_report.content),
+                evidences,
+                cited_ids,
+                citation_errors,
+            )
+
+            # Sources are produced deterministically from IDs actually cited.
             return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
+                "final_report": validated_report,
+                "messages": [AIMessage(content=validated_report)],
+                "citation_errors": citation_errors,
                 **cleared_state
             }
             

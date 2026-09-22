@@ -1,8 +1,10 @@
 """Utility functions and helpers for the Deep Research agent."""
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
@@ -31,7 +33,13 @@ from tavily import AsyncTavilyClient
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.state import (
+    Evidence,
+    EvidenceCandidate,
+    ResearchComplete,
+    SourceDocument,
+    Summary,
+)
 
 ##########################
 # Tavily Search Tool Utils
@@ -46,7 +54,7 @@ async def tavily_search(
     max_results: Annotated[int, InjectedToolArg] = 5,
     topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
     config: RunnableConfig = None
-) -> str:
+) -> dict[str, Any]:
     """Fetch and summarize search results from Tavily search API.
 
     Args:
@@ -56,7 +64,7 @@ async def tavily_search(
         config: Runtime configuration for API keys and model settings
 
     Returns:
-        Formatted string containing summarized search results
+        A model-facing summary plus raw sources retained in researcher state
     """
     # Step 1: Execute search queries asynchronously
     search_results = await tavily_search_async(
@@ -124,7 +132,10 @@ async def tavily_search(
     
     # Step 7: Format the final output
     if not summarized_results:
-        return "No valid search results found. Please try different search queries or use a different search API."
+        return {
+            "content": "No valid search results found. Please try different search queries or use a different search API.",
+            "sources": [],
+        }
     
     formatted_output = "Search results: \n\n"
     for i, (url, result) in enumerate(summarized_results.items()):
@@ -133,7 +144,16 @@ async def tavily_search(
         formatted_output += f"SUMMARY:\n{result['content']}\n\n"
         formatted_output += "\n\n" + "-" * 80 + "\n"
     
-    return formatted_output
+    sources = [
+        SourceDocument(
+            url=url,
+            title=result.get("title", "Untitled source"),
+            raw_content=result.get("raw_content", ""),
+        ).model_dump()
+        for url, result in unique_results.items()
+        if result.get("raw_content")
+    ]
+    return {"content": formatted_output, "sources": sources}
 
 async def tavily_search_async(
     search_queries, 
@@ -211,6 +231,144 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+
+##########################
+# Evidence Utils
+##########################
+
+def normalize_whitespace(value: str) -> str:
+    """Collapse whitespace without otherwise changing source text."""
+    return " ".join(value.split())
+
+
+def _source_excerpt(raw_content: str, quote: str) -> Optional[str]:
+    """Return the exact source substring matching a quote, allowing whitespace changes."""
+    if not quote or not raw_content:
+        return None
+    if quote in raw_content:
+        return quote
+
+    quote_parts = quote.split()
+    if not quote_parts:
+        return None
+    whitespace_tolerant_pattern = r"\s+".join(re.escape(part) for part in quote_parts)
+    match = re.search(whitespace_tolerant_pattern, raw_content)
+    return match.group(0) if match else None
+
+
+def validate_evidence_candidates(
+    candidates: list[EvidenceCandidate],
+    sources: list[SourceDocument],
+    max_evidences: int = 5,
+) -> tuple[list[Evidence], list[str]]:
+    """Accept only candidate quotes that occur in raw content from the same URL."""
+    sources_by_url = {source.url: source for source in sources}
+    evidences: list[Evidence] = []
+    errors: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for position, candidate in enumerate(candidates, start=1):
+        if len(evidences) >= max_evidences:
+            break
+
+        source = sources_by_url.get(candidate.url)
+        if source is None:
+            errors.append(f"Candidate {position}: source URL was not fetched by this researcher: {candidate.url}")
+            continue
+        if not source.raw_content:
+            errors.append(f"Candidate {position}: source has no raw content: {candidate.url}")
+            continue
+
+        exact_quote = _source_excerpt(source.raw_content, candidate.quote)
+        if exact_quote is None:
+            errors.append(f"Candidate {position}: quote was not found verbatim in raw content: {candidate.url}")
+            continue
+
+        dedupe_key = (candidate.url, normalize_whitespace(exact_quote))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        digest = hashlib.sha256(
+            f"{candidate.url}\0{normalize_whitespace(exact_quote)}".encode("utf-8")
+        ).hexdigest()[:10].upper()
+        evidences.append(Evidence(
+            id=f"R-{digest}",
+            url=candidate.url,
+            title=source.title,
+            quote=exact_quote,
+        ))
+
+    return evidences, errors
+
+
+def aggregate_evidences(evidences: list[Evidence]) -> list[Evidence]:
+    """Deduplicate verified evidence and assign final graph-wide E identifiers."""
+    unique: list[Evidence] = []
+    seen: set[tuple[str, str]] = set()
+    for evidence in evidences:
+        key = (evidence.url, normalize_whitespace(evidence.quote))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(evidence)
+
+    return [
+        evidence.model_copy(update={"id": f"E{index}"})
+        for index, evidence in enumerate(unique, start=1)
+    ]
+
+
+def format_evidence_table(evidences: list[Evidence]) -> str:
+    """Format verified evidence for the report writer without exposing raw pages."""
+    if not evidences:
+        return "No verified evidence is available. State this limitation where relevant."
+    return "\n\n".join(
+        f"[{evidence.id}] {evidence.title}\nURL: {evidence.url}\nQUOTE: {evidence.quote}"
+        for evidence in evidences
+    )
+
+
+def validate_report_citations(
+    report: str,
+    evidences: list[Evidence],
+) -> tuple[list[str], list[str]]:
+    """Return cited valid IDs in first-use order and explicit unknown-ID errors."""
+    available_ids = {evidence.id for evidence in evidences}
+    cited_ids: list[str] = []
+    unknown_ids: list[str] = []
+    for match in re.finditer(r"\[(E\d+)\]", report, flags=re.IGNORECASE):
+        evidence_id = match.group(1).upper()
+        target = cited_ids if evidence_id in available_ids else unknown_ids
+        if evidence_id not in target:
+            target.append(evidence_id)
+    errors = [f"Unknown evidence ID cited by writer: {evidence_id}" for evidence_id in unknown_ids]
+    return cited_ids, errors
+
+
+def append_cited_sources(
+    report: str,
+    evidences: list[Evidence],
+    cited_ids: list[str],
+    citation_errors: list[str],
+) -> str:
+    """Append links for cited evidence and visible validation errors without an LLM call."""
+    evidence_by_id = {evidence.id: evidence for evidence in evidences}
+    sections = [report.rstrip()]
+    if cited_ids:
+        source_lines = ["## Sources", ""]
+        source_lines.extend(
+            f"- [{evidence_id}] [{evidence_by_id[evidence_id].title}]({evidence_by_id[evidence_id].url})"
+            for evidence_id in cited_ids
+        )
+        sections.append("\n".join(source_lines))
+    if citation_errors:
+        sections.append(
+            "> Citation validation error: "
+            + "; ".join(citation_errors)
+            + ". No source was created for these IDs."
+        )
+    return "\n\n".join(sections) + "\n"
 
 ##########################
 # Reflection Tool Utils
