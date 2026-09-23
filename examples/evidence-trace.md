@@ -11,8 +11,8 @@ output fields:
 - `research_results`: one structured result per Researcher, containing its summary, locally
   identified verified evidence, and unanswered questions.
 - `evidences`: the deduplicated graph-wide evidence table with final IDs `E1`, `E2`, ... .
-- `final_report`: the Writer output with inline `[E1]` citations and a program-generated
-  `Sources` section containing only evidence actually cited.
+- `final_report`: the quality gate's selected report with inline `[E1]` citations and a
+  program-generated `Sources` section containing only evidence actually cited.
 - `evidence_errors`: rejected candidate quotes and their short reasons.
 - `citation_errors`: IDs emitted by the Writer that were absent from `evidences`.
 
@@ -54,3 +54,4 @@ The deterministic checks require no API credentials:
 pytest -q tests/test_evidence_pipeline.py
 ```
 
+See `examples/evaluation-revision.md` for the second-round evaluation and revision fields.

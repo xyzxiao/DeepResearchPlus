@@ -1,7 +1,7 @@
 """Graph state definitions and data structures for the Deep Research agent."""
 
 import operator
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -67,6 +67,35 @@ class ResearchResult(BaseModel):
     evidences: list[Evidence] = Field(default_factory=list)
     unanswered_questions: list[str] = Field(default_factory=list)
 
+
+class ReviewIssue(BaseModel):
+    """A concrete report problem and an actionable revision instruction."""
+
+    dimension: Literal["completeness", "depth", "evidence"]
+    location: str
+    problem: str
+    suggestion: str
+
+
+class EvaluationResult(BaseModel):
+    """Report-level model review; it is not an independent fact verification."""
+
+    completeness_score: float = Field(ge=0, le=10)
+    depth_score: float = Field(ge=0, le=10)
+    evidence_score: float = Field(ge=0, le=10)
+    issues: list[ReviewIssue] = Field(default_factory=list)
+
+
+class QualityGateDecision(BaseModel):
+    """Deterministic selection made after evaluation and optional revision."""
+
+    selected_version: Literal["draft", "revision"]
+    accepted_revision: bool
+    reason: str
+    selected_overall_score: Optional[float] = None
+    passed: bool
+
+
 class ClarifyWithUser(BaseModel):
     """Model for user clarification requests."""
     
@@ -112,6 +141,18 @@ class AgentState(MessagesState):
     research_results: Annotated[list[ResearchResult], override_reducer] = []
     evidences: Annotated[list[Evidence], override_reducer] = []
     evidence_errors: Annotated[list[str], override_reducer] = []
+    draft_report: Optional[str] = None
+    draft_generation_error: Optional[str] = None
+    draft_citation_errors: list[str] = []
+    initial_evaluation: Optional[EvaluationResult] = None
+    initial_overall_score: Optional[float] = None
+    revised_report: Optional[str] = None
+    revision_citation_errors: list[str] = []
+    revision_evaluation: Optional[EvaluationResult] = None
+    revision_overall_score: Optional[float] = None
+    quality_gate_decision: Optional[QualityGateDecision] = None
+    pipeline_errors: Annotated[list[str], override_reducer] = []
+    final_quality_passed: bool = False
     citation_errors: list[str] = []
     final_report: str
 

@@ -25,8 +25,15 @@ from open_deep_research.prompts import (
     compress_research_system_prompt,
     final_report_generation_prompt,
     lead_researcher_prompt,
+    report_evaluation_prompt,
+    report_revision_prompt,
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
+)
+from open_deep_research.quality import (
+    calculate_overall_score,
+    choose_report_version,
+    evaluation_passes,
 )
 from open_deep_research.state import (
     AgentInputState,
@@ -34,6 +41,8 @@ from open_deep_research.state import (
     ClarifyWithUser,
     ConductResearch,
     Evidence,
+    EvaluationResult,
+    QualityGateDecision,
     ResearchComplete,
     ResearchResult,
     ResearchSynthesis,
@@ -56,6 +65,7 @@ from open_deep_research.utils import (
     is_token_limit_exceeded,
     openai_websearch_called,
     remove_up_to_last_ai_message,
+    strip_sources_section,
     think_tool,
     validate_evidence_candidates,
     validate_report_citations,
@@ -176,7 +186,20 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
             "research_results": {"type": "override", "value": []},
             "evidences": {"type": "override", "value": []},
             "evidence_errors": {"type": "override", "value": []},
+            "draft_report": None,
+            "draft_generation_error": None,
+            "draft_citation_errors": [],
+            "initial_evaluation": None,
+            "initial_overall_score": None,
+            "revised_report": None,
+            "revision_citation_errors": [],
+            "revision_evaluation": None,
+            "revision_overall_score": None,
+            "quality_gate_decision": None,
+            "pipeline_errors": {"type": "override", "value": []},
+            "final_quality_passed": False,
             "citation_errors": [],
+            "final_report": "",
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -701,27 +724,37 @@ researcher_builder.add_edge("compress_research", END)      # Exit point after co
 # Compile researcher subgraph for parallel execution by supervisor
 researcher_subgraph = researcher_builder.compile()
 
-async def final_report_generation(state: AgentState, config: RunnableConfig):
-    """Generate the final comprehensive research report with retry logic for token limits.
-    
-    This function takes all collected research findings and synthesizes them into a 
-    well-structured, comprehensive final report using the configured report generation model.
-    
-    Args:
-        state: Agent state containing research findings and context
-        config: Runtime configuration with model settings and API keys
-        
-    Returns:
-        Dictionary containing the final report and cleared state
-    """
-    # Step 1: Extract research findings and prepare state cleanup
-    notes = state.get("notes", [])
-    cleared_state = {"notes": {"type": "override", "value": []}}
-    findings = "\n".join(notes)
-    evidences = [
+
+def _coerce_evidences(state: AgentState) -> list[Evidence]:
+    """Return evidence state as Pydantic models."""
+    return [
         evidence if isinstance(evidence, Evidence) else Evidence.model_validate(evidence)
         for evidence in state.get("evidences", [])
     ]
+
+
+def _coerce_evaluation(value) -> EvaluationResult | None:
+    """Return optional evaluation state as a Pydantic model."""
+    if value is None or isinstance(value, EvaluationResult):
+        return value
+    return EvaluationResult.model_validate(value)
+
+
+def _report_model_config(configurable: Configuration, config: RunnableConfig) -> dict:
+    """Reuse the existing report model for writing, evaluation, and revision."""
+    return {
+        "model": configurable.final_report_model,
+        "max_tokens": configurable.final_report_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "tags": ["langsmith:nostream"],
+    }
+
+
+async def generate_report_draft(state: AgentState, config: RunnableConfig):
+    """Generate and retain the report body without publishing it or adding Sources."""
+    notes = state.get("notes", [])
+    findings = "\n".join(notes)
+    evidences = _coerce_evidences(state)
     research_results = [
         result if isinstance(result, ResearchResult) else ResearchResult.model_validate(result)
         for result in state.get("research_results", [])
@@ -732,16 +765,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         for question in result.unanswered_questions
     ]
     
-    # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
-    writer_model_config = {
-        "model": configurable.final_report_model,
-        "max_tokens": configurable.final_report_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
-        "tags": ["langsmith:nostream"]
-    }
-    
-    # Step 3: Attempt report generation with token limit retry logic
+    writer_model_config = _report_model_config(configurable, config)
     max_retries = 3
     current_retry = 0
     findings_token_limit = None
@@ -761,28 +786,15 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 date=get_today_str()
             )
             
-            # Generate the final report
-            final_report = await configurable_model.with_config(writer_model_config).ainvoke([
+            draft_response = await configurable_model.with_config(writer_model_config).ainvoke([
                 HumanMessage(content=final_report_prompt)
             ])
-            
-            cited_ids, citation_errors = validate_report_citations(
-                str(final_report.content),
-                evidences,
-            )
-            validated_report = append_cited_sources(
-                str(final_report.content),
-                evidences,
-                cited_ids,
-                citation_errors,
-            )
-
-            # Sources are produced deterministically from IDs actually cited.
+            draft_report = strip_sources_section(str(draft_response.content))
+            _, citation_errors = validate_report_citations(draft_report, evidences)
             return {
-                "final_report": validated_report,
-                "messages": [AIMessage(content=validated_report)],
-                "citation_errors": citation_errors,
-                **cleared_state
+                "draft_report": draft_report,
+                "draft_generation_error": None,
+                "draft_citation_errors": citation_errors,
             }
             
         except Exception as e:
@@ -794,10 +806,15 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     # First retry: determine initial truncation limit
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
+                        error = (
+                            "Draft generation failed: token limit exceeded and the model's "
+                            "maximum context length is unknown."
+                        )
                         return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
-                            "messages": [AIMessage(content="Report generation failed due to token limits")],
-                            **cleared_state
+                            "draft_report": f"Error generating report draft: {e}",
+                            "draft_generation_error": error,
+                            "draft_citation_errors": [],
+                            "pipeline_errors": [error],
                         }
                     # Use 4x token limit as character approximation for truncation
                     findings_token_limit = model_token_limit * 4
@@ -809,19 +826,207 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 findings = findings[:findings_token_limit]
                 continue
             else:
-                # Non-token-limit error: return error immediately
+                error = f"Draft generation failed: {e}"
                 return {
-                    "final_report": f"Error generating final report: {e}",
-                    "messages": [AIMessage(content="Report generation failed due to an error")],
-                    **cleared_state
+                    "draft_report": f"Error generating report draft: {e}",
+                    "draft_generation_error": error,
+                    "draft_citation_errors": [],
+                    "pipeline_errors": [error],
                 }
-    
-    # Step 4: Return failure result if all retries exhausted
+
+    error = "Draft generation failed after maximum retries."
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [AIMessage(content="Report generation failed after maximum retries")],
-        **cleared_state
+        "draft_report": "Error generating report draft: Maximum retries exceeded",
+        "draft_generation_error": error,
+        "draft_citation_errors": [],
+        "pipeline_errors": [error],
     }
+
+
+async def _evaluate_report(
+    report: str,
+    state: AgentState,
+    config: RunnableConfig,
+) -> EvaluationResult:
+    """Run the same rubric for both initial evaluation and re-evaluation."""
+    configurable = Configuration.from_runnable_config(config)
+    evaluator_model = (
+        configurable_model
+        .with_structured_output(EvaluationResult)
+        .with_config(_report_model_config(configurable, config))
+    )
+    prompt = report_evaluation_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        report=report,
+        evidence_table=format_evidence_table(_coerce_evidences(state)),
+    )
+    result = await evaluator_model.ainvoke([HumanMessage(content=prompt)])
+    return result if isinstance(result, EvaluationResult) else EvaluationResult.model_validate(result)
+
+
+async def evaluate_draft(state: AgentState, config: RunnableConfig):
+    """Evaluate the initial draft and compute its overall score in code."""
+    try:
+        evaluation = await _evaluate_report(state.get("draft_report", ""), state, config)
+        return {
+            "initial_evaluation": evaluation,
+            "initial_overall_score": calculate_overall_score(evaluation),
+        }
+    except Exception as e:
+        error = f"Initial evaluation failed: {e}"
+        return {
+            "initial_evaluation": None,
+            "initial_overall_score": None,
+            "pipeline_errors": [error],
+        }
+
+
+def route_after_draft(state: AgentState) -> Literal["evaluate_draft", "quality_gate"]:
+    """Do not attempt evaluation when draft generation itself failed."""
+    return "quality_gate" if state.get("draft_generation_error") else "evaluate_draft"
+
+
+def route_after_initial_evaluation(state: AgentState) -> Literal["revise_report", "quality_gate"]:
+    """Skip revision only when both score thresholds and citation checks pass."""
+    evaluation = _coerce_evaluation(state.get("initial_evaluation"))
+    if evaluation is None:
+        return "quality_gate"
+    if evaluation_passes(evaluation) and not state.get("draft_citation_errors", []):
+        return "quality_gate"
+    return "revise_report"
+
+
+def _format_review_issues(evaluation: EvaluationResult) -> str:
+    """Format concrete issues for the revision model."""
+    if not evaluation.issues:
+        return "No explicit issues were returned. Improve only the dimensions below threshold."
+    return "\n".join(
+        f"- [{issue.dimension}] {issue.location}: {issue.problem} "
+        f"Action: {issue.suggestion}"
+        for issue in evaluation.issues
+    )
+
+
+async def revise_report(state: AgentState, config: RunnableConfig):
+    """Produce at most one candidate revision without searching or adding Sources."""
+    evaluation = _coerce_evaluation(state.get("initial_evaluation"))
+    if evaluation is None:
+        error = "Revision skipped because the initial evaluation is unavailable."
+        return {"revised_report": None, "pipeline_errors": [error]}
+
+    configurable = Configuration.from_runnable_config(config)
+    prompt = report_revision_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        draft_report=state.get("draft_report", ""),
+        review_issues=_format_review_issues(evaluation),
+        evidence_table=format_evidence_table(_coerce_evidences(state)),
+    )
+    try:
+        response = await configurable_model.with_config(
+            _report_model_config(configurable, config)
+        ).ainvoke([HumanMessage(content=prompt)])
+        revised_report = strip_sources_section(str(response.content))
+        _, citation_errors = validate_report_citations(
+            revised_report,
+            _coerce_evidences(state),
+        )
+        return {
+            "revised_report": revised_report,
+            "revision_citation_errors": citation_errors,
+        }
+    except Exception as e:
+        error = f"Revision failed: {e}"
+        return {
+            "revised_report": None,
+            "revision_citation_errors": [],
+            "pipeline_errors": [error],
+        }
+
+
+def route_after_revision(state: AgentState) -> Literal["evaluate_revision", "quality_gate"]:
+    """Re-evaluate only when a revision candidate exists."""
+    return "evaluate_revision" if state.get("revised_report") else "quality_gate"
+
+
+async def evaluate_revision(state: AgentState, config: RunnableConfig):
+    """Re-evaluate the revision with the identical rubric and no old scores."""
+    try:
+        evaluation = await _evaluate_report(state.get("revised_report", ""), state, config)
+        return {
+            "revision_evaluation": evaluation,
+            "revision_overall_score": calculate_overall_score(evaluation),
+        }
+    except Exception as e:
+        error = f"Revision evaluation failed: {e}"
+        return {
+            "revision_evaluation": None,
+            "revision_overall_score": None,
+            "pipeline_errors": [error],
+        }
+
+
+def quality_gate(state: AgentState):
+    """Apply deterministic acceptance and rollback rules."""
+    pipeline_errors = state.get("pipeline_errors", [])
+    decision = choose_report_version(
+        initial_evaluation=_coerce_evaluation(state.get("initial_evaluation")),
+        initial_citation_errors=state.get("draft_citation_errors", []),
+        revision_evaluation=_coerce_evaluation(state.get("revision_evaluation")),
+        revision_citation_errors=state.get("revision_citation_errors", []),
+        failure_reason=pipeline_errors[-1] if pipeline_errors else None,
+    )
+    return {
+        "quality_gate_decision": decision,
+        "final_quality_passed": decision.passed,
+    }
+
+
+def finalize_report(state: AgentState):
+    """Publish only the selected body, then validate citations and append Sources."""
+    decision_value = state.get("quality_gate_decision")
+    decision = (
+        decision_value
+        if isinstance(decision_value, QualityGateDecision)
+        else QualityGateDecision.model_validate(decision_value)
+    )
+    selected_report = (
+        state.get("revised_report", "")
+        if decision.selected_version == "revision"
+        else state.get("draft_report", "")
+    ) or ""
+    selected_evaluation = _coerce_evaluation(
+        state.get("revision_evaluation")
+        if decision.selected_version == "revision"
+        else state.get("initial_evaluation")
+    )
+    evidences = _coerce_evidences(state)
+    selected_report = strip_sources_section(selected_report)
+    cited_ids, citation_errors = validate_report_citations(selected_report, evidences)
+    final_quality_passed = evaluation_passes(selected_evaluation) and not citation_errors
+    selected_score = (
+        calculate_overall_score(selected_evaluation)
+        if selected_evaluation is not None
+        else None
+    )
+    decision = decision.model_copy(update={
+        "selected_overall_score": selected_score,
+        "passed": final_quality_passed,
+    })
+    final_report = append_cited_sources(
+        selected_report,
+        evidences,
+        cited_ids,
+        citation_errors,
+    )
+    return {
+        "quality_gate_decision": decision,
+        "final_quality_passed": final_quality_passed,
+        "final_report": final_report,
+        "citation_errors": citation_errors,
+        "messages": [AIMessage(content=final_report)],
+        "notes": {"type": "override", "value": []},
+    }
+
 
 # Main Deep Researcher Graph Construction
 # Creates the complete deep research workflow from user input to final report
@@ -835,12 +1040,22 @@ deep_researcher_builder = StateGraph(
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # User clarification phase
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # Research planning phase
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
-deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # Report generation phase
+deep_researcher_builder.add_node("generate_report_draft", generate_report_draft)
+deep_researcher_builder.add_node("evaluate_draft", evaluate_draft)
+deep_researcher_builder.add_node("revise_report", revise_report)
+deep_researcher_builder.add_node("evaluate_revision", evaluate_revision)
+deep_researcher_builder.add_node("quality_gate", quality_gate)
+deep_researcher_builder.add_node("finalize_report", finalize_report)
 
 # Define main workflow edges for sequential execution
 deep_researcher_builder.add_edge(START, "clarify_with_user")                       # Entry point
-deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # Research to report
-deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
+deep_researcher_builder.add_edge("research_supervisor", "generate_report_draft")
+deep_researcher_builder.add_conditional_edges("generate_report_draft", route_after_draft)
+deep_researcher_builder.add_conditional_edges("evaluate_draft", route_after_initial_evaluation)
+deep_researcher_builder.add_conditional_edges("revise_report", route_after_revision)
+deep_researcher_builder.add_edge("evaluate_revision", "quality_gate")
+deep_researcher_builder.add_edge("quality_gate", "finalize_report")
+deep_researcher_builder.add_edge("finalize_report", END)
 
 # Compile the complete deep researcher workflow
 deep_researcher = deep_researcher_builder.compile()

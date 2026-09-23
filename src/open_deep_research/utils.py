@@ -346,6 +346,16 @@ def validate_report_citations(
     return cited_ids, errors
 
 
+def strip_sources_section(report: str) -> str:
+    """Remove a model-written trailing Sources/References section before publication."""
+    match = re.search(
+        r"^#{1,6}\s+(?:Sources|References|来源|参考资料|参考文献)\s*:?\s*$",
+        report,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    return report[:match.start()].rstrip() if match else report.strip()
+
+
 def append_cited_sources(
     report: str,
     evidences: list[Evidence],

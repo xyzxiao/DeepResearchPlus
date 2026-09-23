@@ -297,6 +297,76 @@ Format the report in clear markdown with proper structure and include source ref
 """
 
 
+report_evaluation_prompt = """Evaluate the report against the research brief and the supplied evidence table. This is a report-level model review, not an independent claim verifier or a guarantee of factual correctness.
+
+<ResearchBrief>
+{research_brief}
+</ResearchBrief>
+
+<Report>
+{report}
+</Report>
+
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Score each dimension from 0 to 10 using these anchors:
+
+Completeness
+- 0-3: Major requested aspects are absent or the report does not answer the brief.
+- 4-7: The main request is addressed, but one or more meaningful aspects are missing or underdeveloped.
+- 8-10: All major requested aspects are addressed with appropriate scope and explicit limitations.
+
+Depth
+- 0-3: Mostly assertions or surface summary, with little explanation, comparison, applicability, or limitation analysis.
+- 4-7: Some useful reasoning is present, but important causes, comparisons, conditions, or trade-offs remain thin.
+- 8-10: The report explains relevant causes, comparisons, conditions, trade-offs, and limitations at an appropriate depth.
+
+Evidence
+- 0-3: Key claims lack supplied evidence, misuse IDs, contradict quotes, or materially expand beyond their qualifications.
+- 4-7: Evidence generally relates to claims, but some important claims are weakly supported or lose dates, numbers, scope, or conditions.
+- 8-10: Important factual claims use supplied evidence carefully and preserve material dates, numbers, scope, and qualifications.
+
+For every issue:
+- choose exactly one dimension: completeness, depth, or evidence;
+- identify a section heading or quote a short distinctive phrase in location;
+- describe the concrete defect in problem;
+- give a specific editing action in suggestion.
+
+Do not use vague issues such as "increase depth" or "improve quality". Do not calculate or return an overall score; the program computes the arithmetic mean. If there are no material issues, return an empty issues list.
+"""
+
+
+report_revision_prompt = """Revise the draft once in response to the concrete review issues.
+
+<ResearchBrief>
+{research_brief}
+</ResearchBrief>
+
+<DraftReport>
+{draft_report}
+</DraftReport>
+
+<ReviewIssues>
+{review_issues}
+</ReviewIssues>
+
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Requirements:
+- Address the listed issues while preserving content that is already correct and relevant.
+- Use only Evidence IDs present in EvidenceTable, in exact [E1] form.
+- Preserve dates, numbers, scope, applicability conditions, and limitations from evidence quotes.
+- If evidence is insufficient, narrow the conclusion or state the limitation explicitly.
+- Do not invent evidence, add external links, request new research, or claim that report-level review is strict factual verification.
+- Do not add a Sources or References section. The program will validate citations and append sources after final selection.
+- Return only the complete revised report in the same language as the draft.
+"""
+
+
 summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 
 Here is the raw content of the webpage:
