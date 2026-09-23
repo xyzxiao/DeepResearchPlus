@@ -38,3 +38,4 @@ Run the fixed-data tests without API calls:
 pytest -q tests/test_evidence_pipeline.py tests/test_report_quality_flow.py
 ```
 
+See `examples/red-team-verification.md` for the optional targeted adversarial-review path.

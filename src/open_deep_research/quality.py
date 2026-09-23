@@ -2,7 +2,13 @@
 
 from typing import Optional
 
-from open_deep_research.state import EvaluationResult, QualityGateDecision
+from open_deep_research.red_team import all_confirmed_issues_resolved
+from open_deep_research.state import (
+    ConfirmedRedTeamIssue,
+    EvaluationResult,
+    QualityGateDecision,
+    RevisionFixVerification,
+)
 
 # Temporary interview-project thresholds. Keeping them together makes the first
 # quality policy easy to inspect and adjust without adding configuration plumbing.
@@ -37,6 +43,8 @@ def choose_report_version(
     revision_evaluation: Optional[EvaluationResult] = None,
     revision_citation_errors: Optional[list[str]] = None,
     failure_reason: Optional[str] = None,
+    confirmed_issues: Optional[list[ConfirmedRedTeamIssue]] = None,
+    revision_fix_results: Optional[list[RevisionFixVerification]] = None,
 ) -> QualityGateDecision:
     """Select the draft or one revision using the documented heuristic rules."""
     initial_score = (
@@ -45,6 +53,79 @@ def choose_report_version(
         else None
     )
     initial_citations_valid = not initial_citation_errors
+    confirmed = confirmed_issues or []
+    fix_results = revision_fix_results or []
+    revision_errors = revision_citation_errors or []
+
+    if revision_errors:
+        if not initial_citations_valid:
+            reason = (
+                "Both draft and revision contain invalid evidence IDs; keeping the draft "
+                "and preserving its citation error state."
+            )
+        elif confirmed:
+            reason = (
+                "Revision contains invalid evidence IDs; rejecting it even though the "
+                "draft has confirmed Red Team issues."
+            )
+        else:
+            reason = "Revision contains invalid evidence IDs; rejecting it and keeping the draft."
+        return QualityGateDecision(
+            selected_version="draft",
+            accepted_revision=False,
+            reason=reason,
+            selected_overall_score=initial_score,
+            passed=(
+                not confirmed
+                and evaluation_passes(initial_evaluation)
+                and initial_citations_valid
+            ),
+        )
+
+    if confirmed:
+        if revision_evaluation is None:
+            return QualityGateDecision(
+                selected_version="draft",
+                accepted_revision=False,
+                reason=failure_reason or (
+                    "Confirmed Red Team issues exist, but no evaluated revision is available; "
+                    "keeping the draft with unresolved issue state."
+                ),
+                selected_overall_score=initial_score,
+                passed=False,
+            )
+
+        revision_score = calculate_overall_score(revision_evaluation)
+        if not all_confirmed_issues_resolved(confirmed, fix_results):
+            status_by_id = {result.issue_id: result.status for result in fix_results}
+            unresolved = ", ".join(
+                f"{issue.issue_id}={status_by_id.get(issue.issue_id, 'missing')}"
+                for issue in confirmed
+                if status_by_id.get(issue.issue_id) != "resolved"
+            )
+            return QualityGateDecision(
+                selected_version="draft",
+                accepted_revision=False,
+                reason=(
+                    "Confirmed Red Team issues were not all resolved "
+                    f"({unresolved}); keeping the draft with unresolved issue state."
+                ),
+                selected_overall_score=initial_score,
+                passed=False,
+            )
+
+        initial_score_text = f"{initial_score:.2f}" if initial_score is not None else "unavailable"
+        return QualityGateDecision(
+            selected_version="revision",
+            accepted_revision=True,
+            reason=(
+                "All confirmed Red Team issues were resolved and revision citations are valid; "
+                "selecting the correction even though score changes do not control this rule "
+                f"({initial_score_text} to {revision_score:.2f})."
+            ),
+            selected_overall_score=revision_score,
+            passed=evaluation_passes(revision_evaluation),
+        )
 
     if revision_evaluation is None:
         reason = failure_reason or (
@@ -60,31 +141,8 @@ def choose_report_version(
             passed=evaluation_passes(initial_evaluation) and initial_citations_valid,
         )
 
-    revision_errors = revision_citation_errors or []
     revision_score = calculate_overall_score(revision_evaluation)
-    revision_citations_valid = not revision_errors
     initial_score_text = f"{initial_score:.2f}" if initial_score is not None else "unavailable"
-
-    if not initial_citations_valid and not revision_citations_valid:
-        return QualityGateDecision(
-            selected_version="draft",
-            accepted_revision=False,
-            reason=(
-                "Both draft and revision contain invalid evidence IDs; keeping the draft "
-                "and preserving its citation error state."
-            ),
-            selected_overall_score=initial_score,
-            passed=False,
-        )
-
-    if not revision_citations_valid:
-        return QualityGateDecision(
-            selected_version="draft",
-            accepted_revision=False,
-            reason="Revision contains invalid evidence IDs; rejecting it and keeping the draft.",
-            selected_overall_score=initial_score,
-            passed=evaluation_passes(initial_evaluation) and initial_citations_valid,
-        )
 
     if not initial_citations_valid:
         return QualityGateDecision(

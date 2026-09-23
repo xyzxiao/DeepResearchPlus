@@ -25,8 +25,11 @@ from open_deep_research.prompts import (
     compress_research_system_prompt,
     final_report_generation_prompt,
     lead_researcher_prompt,
+    red_team_review_prompt,
+    red_team_verification_prompt,
     report_evaluation_prompt,
     report_revision_prompt,
+    revision_fix_verification_prompt,
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
@@ -35,20 +38,33 @@ from open_deep_research.quality import (
     choose_report_version,
     evaluation_passes,
 )
+from open_deep_research.red_team import (
+    all_confirmed_issues_resolved,
+    build_confirmed_issues,
+    normalize_issue_verifications,
+    normalize_revision_fix_results,
+    validate_red_team_candidates,
+)
 from open_deep_research.state import (
     AgentInputState,
     AgentState,
     ClarifyWithUser,
+    ConfirmedRedTeamIssue,
     ConductResearch,
     Evidence,
     EvaluationResult,
+    IssueVerificationBatch,
     QualityGateDecision,
+    RedTeamIssue,
+    RedTeamReviewResult,
     ResearchComplete,
     ResearchResult,
     ResearchSynthesis,
     ResearcherOutputState,
     ResearcherState,
     ResearchQuestion,
+    RevisionFixVerification,
+    RevisionFixVerificationBatch,
     SourceDocument,
     SupervisorState,
 )
@@ -195,6 +211,16 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
             "revision_citation_errors": [],
             "revision_evaluation": None,
             "revision_overall_score": None,
+            "red_team_status": "pending" if configurable.enable_red_team else "disabled",
+            "red_team_issues": [],
+            "red_team_issue_errors": [],
+            "red_team_verification_status": "pending" if configurable.enable_red_team else "not_needed",
+            "red_team_verifications": [],
+            "red_team_verification_errors": [],
+            "confirmed_red_team_issues": [],
+            "revision_fix_verification_status": "pending" if configurable.enable_red_team else "not_needed",
+            "revision_fix_verifications": [],
+            "revision_fix_verification_errors": [],
             "quality_gate_decision": None,
             "pipeline_errors": {"type": "override", "value": []},
             "final_quality_passed": False,
@@ -740,6 +766,34 @@ def _coerce_evaluation(value) -> EvaluationResult | None:
     return EvaluationResult.model_validate(value)
 
 
+def _coerce_red_team_issues(values) -> list[RedTeamIssue]:
+    """Return validated Red Team issue models from state."""
+    return [
+        value if isinstance(value, RedTeamIssue) else RedTeamIssue.model_validate(value)
+        for value in (values or [])
+    ]
+
+
+def _coerce_confirmed_issues(values) -> list[ConfirmedRedTeamIssue]:
+    """Return validated confirmed issue models from state."""
+    return [
+        value
+        if isinstance(value, ConfirmedRedTeamIssue)
+        else ConfirmedRedTeamIssue.model_validate(value)
+        for value in (values or [])
+    ]
+
+
+def _coerce_fix_verifications(values) -> list[RevisionFixVerification]:
+    """Return validated post-revision verification models from state."""
+    return [
+        value
+        if isinstance(value, RevisionFixVerification)
+        else RevisionFixVerification.model_validate(value)
+        for value in (values or [])
+    ]
+
+
 def _report_model_config(configurable: Configuration, config: RunnableConfig) -> dict:
     """Reuse the existing report model for writing, evaluation, and revision."""
     return {
@@ -886,18 +940,162 @@ def route_after_draft(state: AgentState) -> Literal["evaluate_draft", "quality_g
     return "quality_gate" if state.get("draft_generation_error") else "evaluate_draft"
 
 
-def route_after_initial_evaluation(state: AgentState) -> Literal["revise_report", "quality_gate"]:
-    """Skip revision only when both score thresholds and citation checks pass."""
+def _needs_revision_without_confirmed_issues(state: AgentState) -> bool:
+    """Apply the second-round revision trigger when no confirmed concern exists."""
     evaluation = _coerce_evaluation(state.get("initial_evaluation"))
     if evaluation is None:
-        return "quality_gate"
-    if evaluation_passes(evaluation) and not state.get("draft_citation_errors", []):
-        return "quality_gate"
-    return "revise_report"
+        return False
+    return not (
+        evaluation_passes(evaluation)
+        and not state.get("draft_citation_errors", [])
+    )
 
 
-def _format_review_issues(evaluation: EvaluationResult) -> str:
+def route_after_initial_evaluation(
+    state: AgentState,
+) -> Literal["red_team_review", "revise_report", "quality_gate"]:
+    """Run enabled adversarial review before deciding whether to revise."""
+    if state.get("red_team_status") == "pending":
+        return "red_team_review"
+    return "revise_report" if _needs_revision_without_confirmed_issues(state) else "quality_gate"
+
+
+async def red_team_review(state: AgentState, config: RunnableConfig):
+    """Generate and deterministically validate up to three draft concerns."""
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.enable_red_team:
+        return {
+            "red_team_status": "disabled",
+            "red_team_verification_status": "not_needed",
+            "revision_fix_verification_status": "not_needed",
+        }
+
+    model = (
+        configurable_model
+        .with_structured_output(RedTeamReviewResult)
+        .with_config(_report_model_config(configurable, config))
+    )
+    prompt = red_team_review_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        draft_report=state.get("draft_report", ""),
+        evidence_table=format_evidence_table(_coerce_evidences(state)),
+    )
+    try:
+        result = await model.ainvoke([HumanMessage(content=prompt)])
+        review = (
+            result
+            if isinstance(result, RedTeamReviewResult)
+            else RedTeamReviewResult.model_validate(result)
+        )
+        issues, errors = validate_red_team_candidates(
+            review.issues,
+            state.get("draft_report", ""),
+            _coerce_evidences(state),
+        )
+        return {
+            "red_team_status": "completed",
+            "red_team_issues": issues,
+            "red_team_issue_errors": errors,
+            "red_team_verification_status": "pending" if issues else "not_needed",
+            "revision_fix_verification_status": "pending" if issues else "not_needed",
+        }
+    except Exception as e:
+        error = f"Red Team review failed: {e}"
+        return {
+            "red_team_status": "failed",
+            "red_team_issues": [],
+            "red_team_issue_errors": [error],
+            "red_team_verification_status": "failed",
+            "revision_fix_verification_status": "not_needed",
+            "pipeline_errors": [error],
+        }
+
+
+def route_after_red_team(
+    state: AgentState,
+) -> Literal["verify_red_team_issues", "revise_report", "quality_gate"]:
+    """Skip the verifier when no valid concern survived program checks."""
+    if state.get("red_team_status") == "completed" and state.get("red_team_issues", []):
+        return "verify_red_team_issues"
+    return "revise_report" if _needs_revision_without_confirmed_issues(state) else "quality_gate"
+
+
+def _format_red_team_issues(issues: list[RedTeamIssue]) -> str:
+    return "\n\n".join(issue.model_dump_json(indent=2) for issue in issues)
+
+
+async def verify_red_team_issues(state: AgentState, config: RunnableConfig):
+    """Independently verify all valid concerns in one isolated structured call."""
+    issues = _coerce_red_team_issues(state.get("red_team_issues", []))
+    if not issues:
+        return {
+            "red_team_verification_status": "not_needed",
+            "red_team_verifications": [],
+            "confirmed_red_team_issues": [],
+            "revision_fix_verification_status": "not_needed",
+        }
+
+    configurable = Configuration.from_runnable_config(config)
+    verifier_model = (
+        configurable_model
+        .with_structured_output(IssueVerificationBatch)
+        .with_config(_report_model_config(configurable, config))
+    )
+    prompt = red_team_verification_prompt.format(
+        draft_report=state.get("draft_report", ""),
+        issues=_format_red_team_issues(issues),
+        evidence_table=format_evidence_table(_coerce_evidences(state)),
+    )
+    try:
+        result = await verifier_model.ainvoke([HumanMessage(content=prompt)])
+        batch = (
+            result
+            if isinstance(result, IssueVerificationBatch)
+            else IssueVerificationBatch.model_validate(result)
+        )
+        verifications, errors = normalize_issue_verifications(
+            issues,
+            batch.results,
+            _coerce_evidences(state),
+        )
+        confirmed = build_confirmed_issues(issues, verifications)
+        return {
+            "red_team_verification_status": "completed",
+            "red_team_verifications": verifications,
+            "red_team_verification_errors": errors,
+            "confirmed_red_team_issues": confirmed,
+            "revision_fix_verification_status": "pending" if confirmed else "not_needed",
+        }
+    except Exception as e:
+        error = f"Red Team verification failed: {e}"
+        uncertain_results, normalization_errors = normalize_issue_verifications(
+            issues,
+            [],
+            _coerce_evidences(state),
+        )
+        return {
+            "red_team_verification_status": "failed",
+            "red_team_verifications": uncertain_results,
+            "red_team_verification_errors": [error, *normalization_errors],
+            "confirmed_red_team_issues": [],
+            "revision_fix_verification_status": "not_needed",
+            "pipeline_errors": [error],
+        }
+
+
+def route_after_red_team_verification(
+    state: AgentState,
+) -> Literal["revise_report", "quality_gate"]:
+    """Revise for confirmed issues or the existing evaluator/citation triggers."""
+    if state.get("confirmed_red_team_issues", []):
+        return "revise_report"
+    return "revise_report" if _needs_revision_without_confirmed_issues(state) else "quality_gate"
+
+
+def _format_review_issues(evaluation: EvaluationResult | None) -> str:
     """Format concrete issues for the revision model."""
+    if evaluation is None:
+        return "No evaluator instructions are available."
     if not evaluation.issues:
         return "No explicit issues were returned. Improve only the dimensions below threshold."
     return "\n".join(
@@ -907,10 +1105,18 @@ def _format_review_issues(evaluation: EvaluationResult) -> str:
     )
 
 
+def _format_confirmed_issues(issues: list[ConfirmedRedTeamIssue]) -> str:
+    """Format only independently confirmed concerns for the revision model."""
+    if not issues:
+        return "No confirmed Red Team correction requirements."
+    return "\n\n".join(issue.model_dump_json(indent=2) for issue in issues)
+
+
 async def revise_report(state: AgentState, config: RunnableConfig):
     """Produce at most one candidate revision without searching or adding Sources."""
     evaluation = _coerce_evaluation(state.get("initial_evaluation"))
-    if evaluation is None:
+    confirmed_issues = _coerce_confirmed_issues(state.get("confirmed_red_team_issues", []))
+    if evaluation is None and not confirmed_issues:
         error = "Revision skipped because the initial evaluation is unavailable."
         return {"revised_report": None, "pipeline_errors": [error]}
 
@@ -919,6 +1125,7 @@ async def revise_report(state: AgentState, config: RunnableConfig):
         research_brief=state.get("research_brief", ""),
         draft_report=state.get("draft_report", ""),
         review_issues=_format_review_issues(evaluation),
+        confirmed_issues=_format_confirmed_issues(confirmed_issues),
         evidence_table=format_evidence_table(_coerce_evidences(state)),
     )
     try:
@@ -965,6 +1172,83 @@ async def evaluate_revision(state: AgentState, config: RunnableConfig):
         }
 
 
+def route_after_revision_evaluation(
+    state: AgentState,
+) -> Literal["verify_revision_fixes", "quality_gate"]:
+    """Run targeted follow-up only for previously confirmed concerns."""
+    return (
+        "verify_revision_fixes"
+        if state.get("confirmed_red_team_issues", [])
+        else "quality_gate"
+    )
+
+
+async def verify_revision_fixes(state: AgentState, config: RunnableConfig):
+    """Check only whether previously confirmed concerns were actually corrected."""
+    confirmed_issues = _coerce_confirmed_issues(state.get("confirmed_red_team_issues", []))
+    if not confirmed_issues:
+        return {
+            "revision_fix_verification_status": "not_needed",
+            "revision_fix_verifications": [],
+        }
+
+    configurable = Configuration.from_runnable_config(config)
+    verifier_model = (
+        configurable_model
+        .with_structured_output(RevisionFixVerificationBatch)
+        .with_config(_report_model_config(configurable, config))
+    )
+    prompt = revision_fix_verification_prompt.format(
+        confirmed_issues=_format_confirmed_issues(confirmed_issues),
+        revised_report=state.get("revised_report", ""),
+        evidence_table=format_evidence_table(_coerce_evidences(state)),
+    )
+    try:
+        result = await verifier_model.ainvoke([HumanMessage(content=prompt)])
+        batch = (
+            result
+            if isinstance(result, RevisionFixVerificationBatch)
+            else RevisionFixVerificationBatch.model_validate(result)
+        )
+        fix_results, errors = normalize_revision_fix_results(
+            confirmed_issues,
+            batch.results,
+        )
+        return {
+            "revision_fix_verification_status": "completed",
+            "revision_fix_verifications": fix_results,
+            "revision_fix_verification_errors": errors,
+        }
+    except Exception as e:
+        error = f"Revision fix verification failed: {e}"
+        uncertain_results, normalization_errors = normalize_revision_fix_results(
+            confirmed_issues,
+            [],
+        )
+        return {
+            "revision_fix_verification_status": "failed",
+            "revision_fix_verifications": uncertain_results,
+            "revision_fix_verification_errors": [error, *normalization_errors],
+            "pipeline_errors": [error],
+        }
+
+
+def _adversarial_review_complete(state: AgentState) -> bool:
+    """Return whether enabled targeted review completed without hidden gaps."""
+    red_team_status = state.get("red_team_status", "disabled")
+    if red_team_status == "disabled":
+        return True
+    if red_team_status != "completed":
+        return False
+    if state.get("red_team_issues", []):
+        if state.get("red_team_verification_status") != "completed":
+            return False
+    confirmed = _coerce_confirmed_issues(state.get("confirmed_red_team_issues", []))
+    if confirmed and state.get("revision_fix_verification_status") != "completed":
+        return False
+    return True
+
+
 def quality_gate(state: AgentState):
     """Apply deterministic acceptance and rollback rules."""
     pipeline_errors = state.get("pipeline_errors", [])
@@ -974,7 +1258,16 @@ def quality_gate(state: AgentState):
         revision_evaluation=_coerce_evaluation(state.get("revision_evaluation")),
         revision_citation_errors=state.get("revision_citation_errors", []),
         failure_reason=pipeline_errors[-1] if pipeline_errors else None,
+        confirmed_issues=_coerce_confirmed_issues(state.get("confirmed_red_team_issues", [])),
+        revision_fix_results=_coerce_fix_verifications(
+            state.get("revision_fix_verifications", [])
+        ),
     )
+    if not _adversarial_review_complete(state):
+        decision = decision.model_copy(update={
+            "reason": decision.reason + " Targeted adversarial review was not completed.",
+            "passed": False,
+        })
     return {
         "quality_gate_decision": decision,
         "final_quality_passed": decision.passed,
@@ -1002,7 +1295,23 @@ def finalize_report(state: AgentState):
     evidences = _coerce_evidences(state)
     selected_report = strip_sources_section(selected_report)
     cited_ids, citation_errors = validate_report_citations(selected_report, evidences)
-    final_quality_passed = evaluation_passes(selected_evaluation) and not citation_errors
+    confirmed_issues = _coerce_confirmed_issues(state.get("confirmed_red_team_issues", []))
+    correction_requirements_satisfied = (
+        not confirmed_issues
+        or (
+            decision.selected_version == "revision"
+            and all_confirmed_issues_resolved(
+                confirmed_issues,
+                _coerce_fix_verifications(state.get("revision_fix_verifications", [])),
+            )
+        )
+    )
+    final_quality_passed = (
+        evaluation_passes(selected_evaluation)
+        and not citation_errors
+        and correction_requirements_satisfied
+        and _adversarial_review_complete(state)
+    )
     selected_score = (
         calculate_overall_score(selected_evaluation)
         if selected_evaluation is not None
@@ -1042,8 +1351,11 @@ deep_researcher_builder.add_node("write_research_brief", write_research_brief)  
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
 deep_researcher_builder.add_node("generate_report_draft", generate_report_draft)
 deep_researcher_builder.add_node("evaluate_draft", evaluate_draft)
+deep_researcher_builder.add_node("red_team_review", red_team_review)
+deep_researcher_builder.add_node("verify_red_team_issues", verify_red_team_issues)
 deep_researcher_builder.add_node("revise_report", revise_report)
 deep_researcher_builder.add_node("evaluate_revision", evaluate_revision)
+deep_researcher_builder.add_node("verify_revision_fixes", verify_revision_fixes)
 deep_researcher_builder.add_node("quality_gate", quality_gate)
 deep_researcher_builder.add_node("finalize_report", finalize_report)
 
@@ -1052,8 +1364,17 @@ deep_researcher_builder.add_edge(START, "clarify_with_user")                    
 deep_researcher_builder.add_edge("research_supervisor", "generate_report_draft")
 deep_researcher_builder.add_conditional_edges("generate_report_draft", route_after_draft)
 deep_researcher_builder.add_conditional_edges("evaluate_draft", route_after_initial_evaluation)
+deep_researcher_builder.add_conditional_edges("red_team_review", route_after_red_team)
+deep_researcher_builder.add_conditional_edges(
+    "verify_red_team_issues",
+    route_after_red_team_verification,
+)
 deep_researcher_builder.add_conditional_edges("revise_report", route_after_revision)
-deep_researcher_builder.add_edge("evaluate_revision", "quality_gate")
+deep_researcher_builder.add_conditional_edges(
+    "evaluate_revision",
+    route_after_revision_evaluation,
+)
+deep_researcher_builder.add_edge("verify_revision_fixes", "quality_gate")
 deep_researcher_builder.add_edge("quality_gate", "finalize_report")
 deep_researcher_builder.add_edge("finalize_report", END)
 

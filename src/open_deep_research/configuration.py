@@ -61,6 +61,16 @@ class Configuration(BaseModel):
             }
         }
     )
+    enable_red_team: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Run Red Team review and targeted verification before the single revision"
+            }
+        }
+    )
     max_concurrent_research_units: int = Field(
         default=5,
         metadata={

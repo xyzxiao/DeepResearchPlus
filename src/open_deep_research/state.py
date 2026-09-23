@@ -86,6 +86,75 @@ class EvaluationResult(BaseModel):
     issues: list[ReviewIssue] = Field(default_factory=list)
 
 
+class RedTeamIssueCandidate(BaseModel):
+    """A model-proposed factual concern before deterministic validation."""
+
+    category: Literal["factual_conflict", "overclaim", "unsupported_inference"]
+    report_quote: str
+    concern: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    suggested_fix: str
+
+
+class RedTeamReviewResult(BaseModel):
+    """Structured Red Team output before program-assigned issue IDs."""
+
+    issues: list[RedTeamIssueCandidate] = Field(default_factory=list)
+
+
+class RedTeamIssue(BaseModel):
+    """A locatable Red Team concern with valid, program-assigned identifiers."""
+
+    issue_id: str
+    category: Literal["factual_conflict", "overclaim", "unsupported_inference"]
+    report_quote: str
+    concern: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    suggested_fix: str
+
+
+class IssueVerification(BaseModel):
+    """Independent evidence-based disposition of one Red Team concern."""
+
+    issue_id: str
+    verdict: Literal["confirmed", "dismissed", "uncertain"]
+    reason: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    correction_instruction: str = ""
+
+
+class IssueVerificationBatch(BaseModel):
+    """Batch verifier output for up to three Red Team concerns."""
+
+    results: list[IssueVerification] = Field(default_factory=list)
+
+
+class ConfirmedRedTeamIssue(BaseModel):
+    """A verified concern containing the exact instruction sent to Revision."""
+
+    issue_id: str
+    category: Literal["factual_conflict", "overclaim", "unsupported_inference"]
+    report_quote: str
+    concern: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    verification_reason: str
+    correction_instruction: str
+
+
+class RevisionFixVerification(BaseModel):
+    """Targeted post-revision status for a previously confirmed concern."""
+
+    issue_id: str
+    status: Literal["resolved", "unresolved", "uncertain"]
+    reason: str
+
+
+class RevisionFixVerificationBatch(BaseModel):
+    """Batch post-revision verification output."""
+
+    results: list[RevisionFixVerification] = Field(default_factory=list)
+
+
 class QualityGateDecision(BaseModel):
     """Deterministic selection made after evaluation and optional revision."""
 
@@ -150,6 +219,16 @@ class AgentState(MessagesState):
     revision_citation_errors: list[str] = []
     revision_evaluation: Optional[EvaluationResult] = None
     revision_overall_score: Optional[float] = None
+    red_team_status: Literal["pending", "disabled", "completed", "failed"] = "pending"
+    red_team_issues: list[RedTeamIssue] = []
+    red_team_issue_errors: list[str] = []
+    red_team_verification_status: Literal["pending", "not_needed", "completed", "failed"] = "pending"
+    red_team_verifications: list[IssueVerification] = []
+    red_team_verification_errors: list[str] = []
+    confirmed_red_team_issues: list[ConfirmedRedTeamIssue] = []
+    revision_fix_verification_status: Literal["pending", "not_needed", "completed", "failed"] = "pending"
+    revision_fix_verifications: list[RevisionFixVerification] = []
+    revision_fix_verification_errors: list[str] = []
     quality_gate_decision: Optional[QualityGateDecision] = None
     pipeline_errors: Annotated[list[str], override_reducer] = []
     final_quality_passed: bool = False

@@ -338,6 +338,68 @@ Do not use vague issues such as "increase depth" or "improve quality". Do not ca
 """
 
 
+red_team_review_prompt = """Act as a focused Red Team reviewer. Find at most 3 important factual concerns in the draft report. Return an empty list when no material concern is present; never invent issues to fill a quota.
+
+<ResearchBrief>
+{research_brief}
+</ResearchBrief>
+
+<DraftReport>
+{draft_report}
+</DraftReport>
+
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Only use these categories:
+- factual_conflict: a number, date, entity, comparison, or factual statement conflicts with supplied evidence.
+- overclaim: the report drops a condition, expands scope, or turns possibility into certainty.
+- unsupported_inference: a conclusion goes beyond what the supplied evidence can support.
+
+For each issue:
+- copy a distinctive complete sentence from the draft into report_quote;
+- state the precise factual concern, not a writing-style preference;
+- list only relevant IDs that exist in EvidenceTable; the list may be empty;
+- give a concrete suggested fix;
+- do not create an issue ID because the program assigns it after validation.
+
+This is adversarial issue discovery, not a verdict. Do not assume a concern is correct merely because you raised it.
+"""
+
+
+red_team_verification_prompt = """Independently verify each Red Team concern using only the draft and supplied evidence. The Red Team statements are allegations, not established facts, and must not be presumed correct.
+
+<DraftReport>
+{draft_report}
+</DraftReport>
+
+<IssuesToVerify>
+{issues}
+</IssuesToVerify>
+
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Return exactly one result for every issue_id:
+- confirmed: the supplied material is sufficient to establish that the criticism is valid.
+- dismissed: the supplied material is sufficient to reject the criticism.
+- uncertain: the supplied material lacks context needed to decide.
+
+Requirements:
+- Distinguish "not sufficiently supported" from "proved false".
+- Preserve dates, numbers, comparison targets, scope, and applicability conditions.
+- evidence_ids must contain only evidence actually used in the judgment.
+- confirmed results require a concrete correction_instruction.
+- dismissed and uncertain results should leave correction_instruction empty.
+- Do not use external information, search, or invent evidence.
+- Do not omit a result; omission is not treated as approval by the program.
+
+This verifies only the listed concerns and is not full-report factual verification.
+"""
+
+
 report_revision_prompt = """Revise the draft once in response to the concrete review issues.
 
 <ResearchBrief>
@@ -352,18 +414,46 @@ report_revision_prompt = """Revise the draft once in response to the concrete re
 {review_issues}
 </ReviewIssues>
 
+<ConfirmedRedTeamIssues>
+{confirmed_issues}
+</ConfirmedRedTeamIssues>
+
 <EvidenceTable>
 {evidence_table}
 </EvidenceTable>
 
 Requirements:
 - Address the listed issues while preserving content that is already correct and relevant.
+- Treat only ConfirmedRedTeamIssues as factual correction requirements; do not act on dismissed or uncertain Red Team concerns.
 - Use only Evidence IDs present in EvidenceTable, in exact [E1] form.
 - Preserve dates, numbers, scope, applicability conditions, and limitations from evidence quotes.
 - If evidence is insufficient, narrow the conclusion or state the limitation explicitly.
 - Do not invent evidence, add external links, request new research, or claim that report-level review is strict factual verification.
 - Do not add a Sources or References section. The program will validate citations and append sources after final selection.
 - Return only the complete revised report in the same language as the draft.
+"""
+
+
+revision_fix_verification_prompt = """Check whether the revised report actually resolves each previously confirmed Red Team issue. This is targeted follow-up verification, not a new scan of the full report.
+
+<ConfirmedIssues>
+{confirmed_issues}
+</ConfirmedIssues>
+
+<RevisedReport>
+{revised_report}
+</RevisedReport>
+
+<EvidenceTable>
+{evidence_table}
+</EvidenceTable>
+
+Return exactly one result for every issue_id:
+- resolved: the problematic claim was removed, narrowed, corrected, or restored with the necessary condition.
+- unresolved: the same factual problem remains, including when it is merely rephrased.
+- uncertain: the supplied evidence or revised wording is insufficient to decide.
+
+Do not mark an issue resolved only because the original sentence disappeared. Inspect the revised report's actual claim and reasoning. Do not search or introduce new evidence.
 """
 
 
